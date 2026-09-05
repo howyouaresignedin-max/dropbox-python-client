@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import BinaryIO, Iterator, Optional, Union
 
 import dropbox
-from dropbox.files import FileMetadata, FolderMetadata, DeletedMetadata, WriteMode
+from dropbox.files import (
+    FileMetadata,
+    FolderMetadata,
+    DeletedMetadata,
+    WriteMode,
+    RelocationPath,
+)
+from dropbox.exceptions import ApiError
 
-from .auth import get_dropbox_client, load_credentials
+from .auth import get_dropbox_client
+
+logger = logging.getLogger(__name__)
 
 
 class DropboxClient:
-    """Convenient wrapper around the official Dropbox SDK."""
+    """Convenient, production-oriented wrapper around the official Dropbox SDK."""
 
     def __init__(
         self,
@@ -94,9 +104,9 @@ class DropboxClient:
         elif isinstance(content, bytes):
             data = content
         else:
-            # assume file-like
             data = content.read()
 
+        logger.info("Uploading to %s (%d bytes)", dropbox_path, len(data))
         return self.dbx.files_upload(data, dropbox_path, mode=mode, mute=mute)
 
     def download(self, dropbox_path: str) -> bytes:
@@ -108,7 +118,42 @@ class DropboxClient:
         """Download a Dropbox file to a local path."""
         metadata, response = self.dbx.files_download(dropbox_path)
         Path(local_path).write_bytes(response.content)
+        logger.info("Downloaded %s → %s", dropbox_path, local_path)
         return metadata
+
+    # ------------------------------------------------------------------
+    # Folder & File management
+    # ------------------------------------------------------------------
+    def create_folder(self, path: str) -> FolderMetadata:
+        """Create a folder (and any missing parents)."""
+        logger.info("Creating folder %s", path)
+        return self.dbx.files_create_folder_v2(path).metadata
+
+    def move(self, from_path: str, to_path: str) -> Union[FileMetadata, FolderMetadata]:
+        """Move or rename a file/folder."""
+        logger.info("Moving %s → %s", from_path, to_path)
+        return self.dbx.files_move_v2(from_path, to_path).metadata
+
+    def copy(self, from_path: str, to_path: str) -> Union[FileMetadata, FolderMetadata]:
+        """Copy a file or folder."""
+        logger.info("Copying %s → %s", from_path, to_path)
+        return self.dbx.files_copy_v2(from_path, to_path).metadata
+
+    def delete(self, path: str) -> Union[FileMetadata, FolderMetadata, DeletedMetadata]:
+        """Delete a file or folder."""
+        logger.info("Deleting %s", path)
+        return self.dbx.files_delete_v2(path).metadata
+
+    # ------------------------------------------------------------------
+    # Temporary / Direct links
+    # ------------------------------------------------------------------
+    def get_temporary_link(self, path: str) -> str:
+        """
+        Get a temporary direct download link (usually valid ~4 hours).
+        Useful for streaming or short-lived sharing without creating a permanent shared link.
+        """
+        result = self.dbx.files_get_temporary_link(path)
+        return result.link
 
     # ------------------------------------------------------------------
     # Search
@@ -127,16 +172,29 @@ class DropboxClient:
     # ------------------------------------------------------------------
     # Sharing
     # ------------------------------------------------------------------
-    def create_shared_link(self, path: str, short_url: bool = False) -> str:
-        """Create a shared link and return the URL."""
+    def create_shared_link(self, path: str) -> str:
+        """Create a public shared link and return the URL."""
         settings = dropbox.sharing.SharedLinkSettings(
             requested_visibility=dropbox.sharing.RequestedVisibility.public,
         )
-        link = self.dbx.sharing_create_shared_link_with_settings(path, settings=settings)
-        return link.url
+        try:
+            link = self.dbx.sharing_create_shared_link_with_settings(path, settings=settings)
+            return link.url
+        except ApiError as e:
+            # If a shared link already exists, just return the existing one
+            if (
+                e.error.is_shared_link_already_exists()
+                and e.error.get_shared_link_already_exists().metadata
+            ):
+                return e.error.get_shared_link_already_exists().metadata.url
+            raise
 
     def list_shared_links(self, path: Optional[str] = None):
         return self.dbx.sharing_list_shared_links(path=path).links
+
+    def revoke_shared_link(self, url: str) -> None:
+        """Revoke a shared link."""
+        self.dbx.sharing_revoke_shared_link(url)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -145,16 +203,28 @@ class DropboxClient:
         try:
             self.get_metadata(path)
             return True
-        except dropbox.exceptions.ApiError as e:
-            if isinstance(e.error, dropbox.files.GetMetadataError) and e.error.is_path() and e.error.get_path().is_not_found():
+        except ApiError as e:
+            if (
+                isinstance(e.error, dropbox.files.GetMetadataError)
+                and e.error.is_path()
+                and e.error.get_path().is_not_found()
+            ):
                 return False
             raise
+
+    def ensure_folder(self, path: str) -> FolderMetadata:
+        """Create the folder if it does not already exist."""
+        if self.exists(path):
+            meta = self.get_metadata(path)
+            if isinstance(meta, FolderMetadata):
+                return meta
+            raise ValueError(f"Path exists but is not a folder: {path}")
+        return self.create_folder(path)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # dropbox.Dropbox is context-manager friendly itself
         if hasattr(self.dbx, "__exit__"):
             return self.dbx.__exit__(exc_type, exc_val, exc_tb)
         return False

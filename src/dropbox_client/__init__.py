@@ -4,4 +4,4 @@ from .client import DropboxClient
 from .auth import get_dropbox_client, load_credentials
 
 __all__ = ["DropboxClient", "get_dropbox_client", "load_credentials"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
